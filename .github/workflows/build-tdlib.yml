@@ -3,26 +3,6 @@ name: Build TDLib JNI
 on:
   workflow_dispatch:
     inputs:
-      build_windows:
-        description: 'Build for Windows x64'
-        required: true
-        type: boolean
-        default: true
-      build_linux:
-        description: 'Build for Linux (Ubuntu 22.04)'
-        required: true
-        type: boolean
-        default: true
-      build_android:
-        description: 'Build for Android (all architectures)'
-        required: true
-        type: boolean
-        default: true
-      build_javadoc:
-        description: 'Build Javadoc documentation'
-        required: true
-        type: boolean
-        default: false
       tdlib_commit:
         description: 'TDLib commit/branch (empty = latest)'
         required: false
@@ -44,14 +24,17 @@ jobs:
     steps:
       - name: Get TDLib commit
         id: get-commit
+        env:
+          INPUT_COMMIT: ${{ inputs.tdlib_commit }}
+          TDLIB_REPO_URL: ${{ env.TDLIB_REPO }}
         run: |
-          if [ -n "${{ inputs.tdlib_commit }}" ]; then
-            COMMIT_SHA=$(git ls-remote ${{ env.TDLIB_REPO }} ${{ inputs.tdlib_commit }} | head -1 | cut -f1)
+          if [ -n "$INPUT_COMMIT" ]; then
+            COMMIT_SHA=$(git ls-remote "$TDLIB_REPO_URL" "$INPUT_COMMIT" | head -1 | cut -f1)
             if [ -z "$COMMIT_SHA" ]; then
-              COMMIT_SHA="${{ inputs.tdlib_commit }}"
+              COMMIT_SHA="$INPUT_COMMIT"
             fi
           else
-            COMMIT_SHA=$(git ls-remote ${{ env.TDLIB_REPO }} HEAD | cut -f1)
+            COMMIT_SHA=$(git ls-remote "$TDLIB_REPO_URL" HEAD | cut -f1)
           fi
           
           COMMIT_SHORT=${COMMIT_SHA:0:7}
@@ -64,7 +47,6 @@ jobs:
   # Windows x64 Build (Static)
   # ============================================
   build-windows:
-    if: ${{ inputs.build_windows }}
     needs: get-tdlib-version
     runs-on: windows-2022
     
@@ -116,6 +98,8 @@ jobs:
           with open('CMakeLists.txt', 'r') as f:
               content = f.read()
           
+          original_content = content
+          
           content = re.sub(
               r'add_dependencies\(tdjni\s+td_generate_java_api\s+build_java\s+generate_javadoc\)',
               'add_dependencies(tdjni td_generate_java_api)',
@@ -131,6 +115,11 @@ jobs:
               'add_dependencies(tdjni td_generate_java_api)',
               content
           )
+          
+          if original_content == content:
+              print("::warning::CMakeLists.txt patch pattern not matched! TDLib build might fail or build unnecessary Java targets.")
+          else:
+              print("CMakeLists.txt patched successfully.")
           
           with open('CMakeLists.txt', 'w') as f:
               f.write(content)
@@ -210,11 +199,17 @@ jobs:
   # Linux (Ubuntu 22.04) Build (Dynamic)
   # ============================================
   build-linux:
-    if: ${{ inputs.build_linux }}
     needs: get-tdlib-version
     runs-on: ubuntu-22.04
     
     steps:
+      - name: Checkout own repository (converter)
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            tools/convert_tdapi.py
+          sparse-checkout-cone-mode: false
+
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -264,6 +259,8 @@ jobs:
           with open('CMakeLists.txt', 'r') as f:
               content = f.read()
           
+          original_content = content
+          
           content = re.sub(
               r'add_dependencies\(tdjni\s+td_generate_java_api\s+build_java\s+generate_javadoc\)',
               'add_dependencies(tdjni td_generate_java_api)',
@@ -279,6 +276,11 @@ jobs:
               'add_dependencies(tdjni td_generate_java_api)',
               content
           )
+          
+          if original_content == content:
+              print("::warning::CMakeLists.txt patch pattern not matched! TDLib build might fail or build unnecessary Java targets.")
+          else:
+              print("CMakeLists.txt patched successfully.")
           
           with open('CMakeLists.txt', 'w') as f:
               f.write(content)
@@ -298,6 +300,46 @@ jobs:
         run: |
           cd td/example/java/build
           cmake --build . --target tdjni --parallel $(nproc)
+
+      - name: Convert TdApi.java to TdApi.kt
+        run: |
+          JAVA_FILE=$(find td -name "TdApi.java" -type f 2>/dev/null | head -1)
+          if [ -z "$JAVA_FILE" ]; then
+            echo "::error::TdApi.java not found after build — td_generate_java_api may have failed silently."
+            exit 1
+          fi
+          mkdir -p artifacts/kotlin
+          cp "$JAVA_FILE" artifacts/kotlin/TdApi.java
+          cp tools/convert_tdapi.py artifacts/kotlin/convert_tdapi.py
+          
+          # Copy Client.java for Javadoc generation
+          CLIENT_FILE="td/example/java/org/drinkless/tdlib/Client.java"
+          if [ -f "$CLIENT_FILE" ]; then
+            cp "$CLIENT_FILE" artifacts/kotlin/Client.java
+          else
+            echo "::warning::Client.java not found at expected path. Javadoc generation might fail."
+          fi
+          
+          cd artifacts/kotlin
+          CONVERTER_STRICT=1 python3 convert_tdapi.py
+
+      - name: Verify TdApi.kt compiles
+        run: |
+          KOTLIN_VERSION="2.0.21"
+          curl -sL "https://github.com/JetBrains/kotlin/releases/download/v${KOTLIN_VERSION}/kotlin-compiler-${KOTLIN_VERSION}.zip" -o kotlinc.zip
+          unzip -q kotlinc.zip
+          ./kotlinc-${KOTLIN_VERSION}/bin/kotlinc artifacts/kotlin/TdApi.kt -d /tmp/tdapi-check.jar
+          echo "TdApi.kt compiles cleanly."
+
+      - name: Upload TdApi.kt artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tdlib-tdapi-kotlin-${{ needs.get-tdlib-version.outputs.commit_short }}
+          path: |
+            artifacts/kotlin/TdApi.kt
+            artifacts/kotlin/TdApi.conversion-stats.json
+            artifacts/kotlin/TdApi.java
+            artifacts/kotlin/Client.java
 
       - name: Find and prepare artifacts
         run: |
@@ -328,7 +370,6 @@ jobs:
   # Android Build (using official scripts)
   # ============================================
   build-android:
-    if: ${{ inputs.build_android }}
     needs: get-tdlib-version
     runs-on: ubuntu-22.04
 
@@ -428,128 +469,69 @@ jobs:
         with:
           name: tdlib-jni-android-armeabi-v7a-${{ needs.get-tdlib-version.outputs.commit_short }}
           path: artifacts/android/armeabi-v7a/libtdjni.so
-          if-no-files-found: warn
+          if-no-files-found: error
 
       - name: Upload Android arm64-v8a artifact
         uses: actions/upload-artifact@v4
         with:
           name: tdlib-jni-android-arm64-v8a-${{ needs.get-tdlib-version.outputs.commit_short }}
           path: artifacts/android/arm64-v8a/libtdjni.so
-          if-no-files-found: warn
+          if-no-files-found: error
 
       - name: Upload Android x86 artifact
         uses: actions/upload-artifact@v4
         with:
           name: tdlib-jni-android-x86-${{ needs.get-tdlib-version.outputs.commit_short }}
           path: artifacts/android/x86/libtdjni.so
-          if-no-files-found: warn
+          if-no-files-found: error
 
       - name: Upload Android x86_64 artifact
         uses: actions/upload-artifact@v4
         with:
           name: tdlib-jni-android-x86_64-${{ needs.get-tdlib-version.outputs.commit_short }}
           path: artifacts/android/x86_64/libtdjni.so
-          if-no-files-found: warn
+          if-no-files-found: error
 
   # ============================================
   # Build Javadoc Documentation
   # ============================================
   build-javadoc:
-    if: ${{ inputs.build_javadoc }}
-    needs: get-tdlib-version
-    runs-on: ubuntu-22.04
+    needs: [get-tdlib-version, build-linux]
+    runs-on: ubuntu-latest
     
     steps:
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            cmake \
-            gperf \
-            libssl-dev \
-            zlib1g-dev \
-            php-cli
-
       - name: Setup JDK
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Clone TDLib
-        run: |
-          git clone ${{ env.TDLIB_REPO }} td
-          cd td
-          git checkout ${{ needs.get-tdlib-version.outputs.commit_sha }}
-
-      - name: Configure TDLib with JNI
-        run: |
-          cd td
-          mkdir -p jnibuild
-          cd jnibuild
-          cmake \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DTD_ENABLE_JNI=ON \
-            -DCMAKE_INSTALL_PREFIX:PATH=../example/java/td \
-            ..
-
-      - name: Build and Install TDLib
-        run: |
-          cd td/jnibuild
-          cmake --build . --target install --parallel $(nproc)
-
-      - name: Generate Java API
-        run: |
-          cd td/example/java
-          mkdir -p build
-          cd build
-          cmake \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DTd_DIR=${{ github.workspace }}/td/example/java/td/lib/cmake/Td \
-            ..
-          cmake --build . --target td_generate_java_api
+      - name: Download Java sources
+        uses: actions/download-artifact@v4
+        with:
+          name: tdlib-tdapi-kotlin-${{ needs.get-tdlib-version.outputs.commit_short }}
+          path: java-sources
 
       - name: Generate Javadoc
         run: |
-          cd td/example/java
-          mkdir -p docs
+          mkdir -p artifacts/javadoc
+          mkdir -p artifacts/java-sources/org/drinkless/tdlib
           
-          javadoc \
-            -d docs \
-            -sourcepath . \
+          cp java-sources/TdApi.java artifacts/java-sources/org/drinkless/tdlib/
+          cp java-sources/Client.java artifacts/java-sources/org/drinkless/tdlib/
+          
+          if ! javadoc \
+            -d artifacts/javadoc \
+            -sourcepath artifacts/java-sources \
             -windowtitle "TDLib Java API" \
             -doctitle "TDLib Java API Documentation" \
             -header "TDLib JNI" \
             -Xdoclint:none \
             -quiet \
             org/drinkless/tdlib/TdApi.java \
-            org/drinkless/tdlib/Client.java \
-            2>/dev/null || true
-          
-          if [ ! -f "docs/index.html" ]; then
-            echo "Creating minimal docs..."
-            mkdir -p docs
-            cat > docs/index.html << 'HTMLEOF'
-          <!DOCTYPE html>
-          <html>
-          <head><title>TDLib Java API</title></head>
-          <body>
-          <h1>TDLib Java API</h1>
-          <p>Please refer to the source files: TdApi.java and Client.java</p>
-          </body>
-          </html>
-          HTMLEOF
+            org/drinkless/tdlib/Client.java; then
+            echo "::warning::Javadoc generation failed. Check the logs for errors."
           fi
-
-      - name: Prepare artifacts
-        run: |
-          mkdir -p artifacts/javadoc
-          mkdir -p artifacts/java-sources/org/drinkless/tdlib
-          
-          cp -r td/example/java/docs/* artifacts/javadoc/ || true
-          cp td/example/java/org/drinkless/tdlib/TdApi.java artifacts/java-sources/org/drinkless/tdlib/
-          cp td/example/java/org/drinkless/tdlib/Client.java artifacts/java-sources/org/drinkless/tdlib/
           
           cat > artifacts/VERSION.txt << EOF
           TDLib Javadoc
@@ -593,6 +575,7 @@ jobs:
           mkdir -p release/android/arm64-v8a
           mkdir -p release/android/x86
           mkdir -p release/android/x86_64
+          mkdir -p release/kotlin
           mkdir -p release/javadoc
           mkdir -p release/java-sources
           
@@ -603,6 +586,16 @@ jobs:
           [ -d "all-artifacts/tdlib-jni-android-arm64-v8a-$COMMIT_SHORT" ] && cp all-artifacts/tdlib-jni-android-arm64-v8a-$COMMIT_SHORT/* release/android/arm64-v8a/ || true
           [ -d "all-artifacts/tdlib-jni-android-x86-$COMMIT_SHORT" ] && cp all-artifacts/tdlib-jni-android-x86-$COMMIT_SHORT/* release/android/x86/ || true
           [ -d "all-artifacts/tdlib-jni-android-x86_64-$COMMIT_SHORT" ] && cp all-artifacts/tdlib-jni-android-x86_64-$COMMIT_SHORT/* release/android/x86_64/ || true
+
+          # Copy generated Kotlin API
+          TDAPI_CONVERSION_SUMMARY="TdApi.kt was not generated (build-linux did not run or failed)."
+          if [ -d "all-artifacts/tdlib-tdapi-kotlin-$COMMIT_SHORT" ]; then
+            cp all-artifacts/tdlib-tdapi-kotlin-$COMMIT_SHORT/TdApi.kt release/kotlin/ || true
+            if [ -f "all-artifacts/tdlib-tdapi-kotlin-$COMMIT_SHORT/TdApi.conversion-stats.json" ]; then
+              cp all-artifacts/tdlib-tdapi-kotlin-$COMMIT_SHORT/TdApi.conversion-stats.json release/kotlin/ || true
+              TDAPI_CONVERSION_SUMMARY=$(cat all-artifacts/tdlib-tdapi-kotlin-$COMMIT_SHORT/TdApi.conversion-stats.json)
+            fi
+          fi
           
           # Copy javadoc
           if [ -d "all-artifacts/tdlib-javadoc-$COMMIT_SHORT" ]; then
@@ -628,13 +621,24 @@ jobs:
           - Android arm64-v8a (API 21+, static linking)
           - Android x86 (API 21+, static linking)
           - Android x86_64 (API 21+, static linking)
+          
+          TdApi.kt conversion stats:
+          $TDAPI_CONVERSION_SUMMARY
           EOL
           
           echo "=== Build artifacts ==="
           find release -type f -ls
 
+      - name: Create release zip
+        run: |
+          COMMIT_SHORT=${{ needs.get-tdlib-version.outputs.commit_short }}
+          cd release
+          zip -r "../expressogram-tdlib-$COMMIT_SHORT.zip" .
+          cd ..
+          ls -lh "expressogram-tdlib-$COMMIT_SHORT.zip"
+
       - name: Upload combined release
         uses: actions/upload-artifact@v4
         with:
-          name: tdlib-jni-all-platforms-${{ needs.get-tdlib-version.outputs.commit_short }}
-          path: release/
+          name: expressogram-tdlib-${{ needs.get-tdlib-version.outputs.commit_short }}
+          path: expressogram-tdlib-${{ needs.get-tdlib-version.outputs.commit_short }}.zip
