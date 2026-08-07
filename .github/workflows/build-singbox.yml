@@ -3,6 +3,9 @@ name: Build sing-box
 on:
   workflow_dispatch:
 
+env:
+  GO_VERSION: "1.23"
+
 jobs:
   build:
     name: Build ${{ matrix.target }}
@@ -14,7 +17,7 @@ jobs:
             goos: android
             goarch: arm64
             os_dir: android/arm64-v8a
-            file_name: libbox.so
+            file_name: sing-box
             ndk: true
             cc: aarch64-linux-android24-clang
 
@@ -22,7 +25,7 @@ jobs:
             goos: android
             goarch: arm
             os_dir: android/armeabi-v7a
-            file_name: libbox.so
+            file_name: sing-box
             ndk: true
             cc: armv7a-linux-androideabi24-clang
 
@@ -30,7 +33,7 @@ jobs:
             goos: android
             goarch: amd64
             os_dir: android/x86_64
-            file_name: libbox.so
+            file_name: sing-box
             ndk: true
             cc: x86_64-linux-android24-clang
 
@@ -38,7 +41,7 @@ jobs:
             goos: android
             goarch: 386
             os_dir: android/x86
-            file_name: libbox.so
+            file_name: sing-box
             ndk: true
             cc: i686-linux-android24-clang
 
@@ -76,7 +79,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.23.0'
+          go-version: ${{ env.GO_VERSION }}
           cache: true
 
       - name: Setup Android NDK
@@ -86,11 +89,18 @@ jobs:
         with:
           ndk-version: r26d
 
-      - name: Install dependencies
-        if: matrix.target == 'windows-x64'
+      - name: Install dependencies (mingw, wine, upx)
+        if: matrix.target == 'windows-x64' || matrix.target == 'linux-x64'
         run: |
           sudo apt-get update
-          sudo apt-get install -y mingw-w64 wine
+          sudo apt-get install -y mingw-w64 wine upx-ucl
+
+      - name: Install UPX for Android
+        if: matrix.ndk
+        run: |
+          wget -q https://github.com/upx/upx/releases/download/v4.2.4/upx-4.2.4-amd64_linux.tar.xz
+          tar -xf upx-4.2.4-amd64_linux.tar.xz
+          sudo mv upx-4.2.4-amd64_linux/upx /usr/local/bin/
 
       - name: Build sing-box
         env:
@@ -99,17 +109,22 @@ jobs:
           CGO_LDFLAGS: ${{ matrix.ndk && '-Wl,-z,max-page-size=16384' || '' }}
         run: |
           mkdir -p singbox-multiplatform/${{ matrix.os_dir }}
-          
+
           if [ "${{ matrix.ndk }}" = "true" ]; then
             export CGO_ENABLED=1
             export CC="${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.cc }}"
           else
             export CGO_ENABLED=0
           fi
-          
-          go build -v -trimpath -tags "with_quic,with_wireguard,with_utls,with_clash_api" \
+
+          go build -v -trimpath -buildvcs=false -tags "with_quic,with_wireguard,with_utls,netgo" \
             -ldflags "-s -w" \
             -o "singbox-multiplatform/${{ matrix.os_dir }}/${{ matrix.file_name }}" ./cmd/sing-box
+
+      - name: Compress binary with UPX
+        run: |
+          BIN_PATH="singbox-multiplatform/${{ matrix.os_dir }}/${{ matrix.file_name }}"
+          upx --best --lzma "$BIN_PATH"
 
       - name: Verify binary format
         run: file singbox-multiplatform/${{ matrix.os_dir }}/${{ matrix.file_name }}
@@ -119,7 +134,7 @@ jobs:
         run: |
           BIN_PATH="singbox-multiplatform/${{ matrix.os_dir }}/${{ matrix.file_name }}"
           chmod +x "$BIN_PATH"
-          
+
           if [ "${{ matrix.target }}" = "windows-x64" ]; then
             wine "$BIN_PATH" version
           elif [ "${{ matrix.target }}" = "linux-x64" ]; then
@@ -157,8 +172,16 @@ jobs:
       - name: Display structure of downloaded files
         run: find final-singbox-multiplatform -type f
 
+      - name: Create versioned zip archive
+        run: |
+          VERSION=${{ steps.get_tag.outputs.version }}
+          cd final-singbox-multiplatform
+          zip -r "../singbox-multiplatform-v${VERSION}.zip" .
+          cd ..
+          ls -lh singbox-multiplatform-v${VERSION}.zip
+
       - name: Upload final combined artifact
         uses: actions/upload-artifact@v4
         with:
-          name: singbox-multiplatform-${{ steps.get_tag.outputs.version }}
-          path: final-singbox-multiplatform
+          name: singbox-multiplatform-v${{ steps.get_tag.outputs.version }}
+          path: singbox-multiplatform-v${{ steps.get_tag.outputs.version }}.zip
