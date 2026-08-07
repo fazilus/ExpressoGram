@@ -1,0 +1,212 @@
+name: Build tg-ws-proxy
+
+on:
+  workflow_dispatch:
+
+env:
+  GO_VERSION: "1.23"
+  GOFLAGS: "-trimpath"
+  ANDROID_NDK: 26.1.10909125
+  GO_WS_REPO: spatiumstas/tg-ws-proxy-go
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Android ABIs -> shared/src/androidMain/jniLibs/<abi>/libtgws.so.
+          # arm64 builds statically (pure Go); arm/386/amd64 need the NDK
+          # (cgo) because Go only supports static linking for android/arm64.
+          - name: android-arm64
+            goos: android
+            goarch: arm64
+            goarm: ""
+            ndk: ""
+            clang: ""
+            smoke: ""
+            output: shared/src/androidMain/jniLibs/arm64-v8a/libtgws.so
+          - name: android-arm32
+            goos: android
+            goarch: arm
+            goarm: "7"
+            ndk: true
+            clang: armv7a-linux-androideabi21-clang
+            smoke: ""
+            output: shared/src/androidMain/jniLibs/armeabi-v7a/libtgws.so
+          - name: android-x86
+            goos: android
+            goarch: 386
+            goarm: ""
+            ndk: true
+            clang: i686-linux-android21-clang
+            smoke: ""
+            output: shared/src/androidMain/jniLibs/x86/libtgws.so
+          - name: android-x86_64
+            goos: android
+            goarch: amd64
+            goarm: ""
+            ndk: true
+            clang: x86_64-linux-android21-clang
+            smoke: ""
+            output: shared/src/androidMain/jniLibs/x86_64/libtgws.so
+          # Desktop JVM (resources/binaries/tgws-*)
+          - name: windows-x64
+            goos: windows
+            goarch: amd64
+            goarm: ""
+            ndk: false
+            clang: ""
+            smoke: wine
+            output: shared/src/jvmMain/resources/binaries/tgws-windows-x64.exe
+          - name: linux-x64
+            goos: linux
+            goarch: amd64
+            goarm: ""
+            ndk: false
+            clang: ""
+            smoke: native
+            output: shared/src/jvmMain/resources/binaries/tgws-linux-x64
+
+    steps:
+      - name: Resolve latest stable release tag
+        env:
+          GIT_URL: https://github.com/${{ env.GO_WS_REPO }}
+        run: |
+          REPO="${{ env.GO_WS_REPO }}"
+          API_URL="https://api.github.com/repos/$REPO/releases/latest"
+          REF=$(curl -fsSL "$API_URL" | jq -r .tag_name)
+          if [ -z "$REF" ] || [ "$REF" = "null" ]; then
+            echo "::warning::No stable release found, using default branch"
+            REF=$(git ls-remote --symref "$GIT_URL" HEAD \
+              | head -1 | awk -F/ '{print $NF}')
+            REF="${REF:-HEAD}"
+          fi
+          echo "RESOLVED_REF=$REF" >> "$GITHUB_ENV"
+
+      - name: Checkout source at release
+        env:
+          GIT_URL: https://github.com/${{ env.GO_WS_REPO }}
+        run: |
+          git clone --depth 1 \
+            --branch "$RESOLVED_REF" "$GIT_URL" ws
+          cd ws
+          TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo untagged)
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          SHA=$(git rev-parse --short=12 HEAD)
+          echo "SHA=$SHA" >> "$GITHUB_ENV"
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: ws/src/go.sum
+
+      - name: Set up Android SDK
+        if: ${{ matrix.ndk }}
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK (cgo ABIs)
+        if: ${{ matrix.ndk }}
+        run: |
+          sdkmanager --install "ndk;${{ env.ANDROID_NDK }}" >/dev/null
+          echo "NDK_ROOT=$ANDROID_SDK_ROOT/ndk/${{ env.ANDROID_NDK }}" \
+            >> "$GITHUB_ENV"
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_LDFLAGS: ${{ matrix.ndk && '-Wl,-z,max-page-size=16384' || '' }}
+        run: |
+          cd ws/src
+          out="$GITHUB_WORKSPACE/${{ matrix.output }}"
+          mkdir -p "$(dirname "$out")"
+          if [ "${{ matrix.ndk }}" = "true" ]; then
+            export CGO_ENABLED=1
+            cc_bin="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin"
+            export CC="$cc_bin/${{ matrix.clang }}"
+          else
+            export CGO_ENABLED=0
+          fi
+          go build -ldflags "-s -w" -o "$out" .
+          file "$out"
+
+      # Smoke-test each runnable binary by actually executing it. The bridge
+      # starts a server and blocks (exit 124/255 on timeout), which proves it
+      # runs; only a non-runnable format (126/127) is a failure.
+      # Android ABIs are omitted
+      - name: Smoke-test binary
+        if: ${{ matrix.smoke }}
+        run: |
+          bin="$GITHUB_WORKSPACE/${{ matrix.output }}"
+          if [ "${{ matrix.smoke }}" = "wine" ]; then
+            sudo apt-get update -qq >/dev/null
+            sudo apt-get install -y -qq wine64 >/dev/null
+            export WINEDEBUG=-all
+            export WINEPREFIX="$HOME/.wine-smoke"
+            runcmd="wine $bin"
+          else
+            runcmd="$bin"
+          fi
+          set +e
+          timeout 30 bash -c "$runcmd" >/dev/null 2>&1
+          rc=$?
+          set -e
+          if [ "$rc" -eq 126 ] || [ "$rc" -eq 127 ]; then
+            echo "::error::binary cannot be executed: $bin (rc=$rc)"
+            exit 1
+          fi
+          echo "smoke ok: $bin (rc=$rc)"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tgws-${{ matrix.name }}-${{ env.TAG }}-${{ env.SHA }}
+          path: ${{ matrix.output }}
+          if-no-files-found: error
+
+  combine:
+    name: Combine release zip
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: all-artifacts
+          pattern: tgws-*
+          merge-multiple: false
+
+      - name: Assemble release tree
+        run: |
+          set -e
+          mkdir -p release/android/armeabi-v7a \
+            release/android/arm64-v8a \
+            release/android/x86 \
+            release/android/x86_64 \
+            release/windows \
+            release/linux
+          cp all-artifacts/tgws-android-arm64-*/libtgws.so \
+            release/android/arm64-v8a/libtgws.so
+          cp all-artifacts/tgws-android-arm32-*/libtgws.so \
+            release/android/armeabi-v7a/libtgws.so
+          cp all-artifacts/tgws-android-x86-*/libtgws.so \
+            release/android/x86/libtgws.so
+          cp all-artifacts/tgws-android-x86_64-*/libtgws.so \
+            release/android/x86_64/libtgws.so
+          cp all-artifacts/tgws-windows-x64-*/tgws-windows-x64.exe \
+            release/windows/tgws-windows-x64.exe
+          cp all-artifacts/tgws-linux-x64-*/tgws-linux-x64 \
+            release/linux/tgws-linux-x64
+          find release -type f -exec ls -L {} +
+
+      - name: Upload release tree
+        uses: actions/upload-artifact@v4
+        with:
+          name: expressogram-tgws-binaries
+          path: release
+          if-no-files-found: error
