@@ -1,0 +1,164 @@
+name: Build sing-box
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: android-arm64
+            goos: android
+            goarch: arm64
+            os_dir: android/arm64-v8a
+            file_name: libbox.so
+            ndk: true
+            cc: aarch64-linux-android24-clang
+
+          - target: android-arm32
+            goos: android
+            goarch: arm
+            os_dir: android/armeabi-v7a
+            file_name: libbox.so
+            ndk: true
+            cc: armv7a-linux-androideabi24-clang
+
+          - target: android-x86_64
+            goos: android
+            goarch: amd64
+            os_dir: android/x86_64
+            file_name: libbox.so
+            ndk: true
+            cc: x86_64-linux-android24-clang
+
+          - target: android-x86
+            goos: android
+            goarch: 386
+            os_dir: android/x86
+            file_name: libbox.so
+            ndk: true
+            cc: i686-linux-android24-clang
+
+          - target: windows-x64
+            goos: windows
+            goarch: amd64
+            os_dir: windows
+            file_name: sing-box.exe
+            ndk: false
+            cc: ""
+
+          - target: linux-x64
+            goos: linux
+            goarch: amd64
+            os_dir: linux
+            file_name: sing-box
+            ndk: false
+            cc: ""
+
+    steps:
+      - name: Get latest release tag
+        id: get_tag
+        run: |
+          TAG=$(gh release view --repo SagerNet/sing-box --json tagName -q .tagName)
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Checkout sing-box source
+        uses: actions/checkout@v4
+        with:
+          repository: SagerNet/sing-box
+          ref: ${{ steps.get_tag.outputs.tag }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.0'
+          cache: true
+
+      - name: Setup Android NDK
+        if: matrix.ndk
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r26d
+
+      - name: Install dependencies
+        if: matrix.target == 'windows-x64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mingw-w64 wine
+
+      - name: Build sing-box
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_LDFLAGS: ${{ matrix.ndk && '-Wl,-z,max-page-size=16384' || '' }}
+        run: |
+          mkdir -p singbox-multiplatform/${{ matrix.os_dir }}
+          
+          if [ "${{ matrix.ndk }}" = "true" ]; then
+            export CGO_ENABLED=1
+            export CC="${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.cc }}"
+          else
+            export CGO_ENABLED=0
+          fi
+          
+          go build -v -trimpath -tags "with_quic,with_wireguard,with_utls,with_clash_api" \
+            -ldflags "-s -w" \
+            -o "singbox-multiplatform/${{ matrix.os_dir }}/${{ matrix.file_name }}" ./cmd/sing-box
+
+      - name: Verify binary format
+        run: file singbox-multiplatform/${{ matrix.os_dir }}/${{ matrix.file_name }}
+
+      - name: Smoke test
+        if: matrix.target == 'windows-x64' || matrix.target == 'linux-x64'
+        run: |
+          BIN_PATH="singbox-multiplatform/${{ matrix.os_dir }}/${{ matrix.file_name }}"
+          chmod +x "$BIN_PATH"
+          
+          if [ "${{ matrix.target }}" = "windows-x64" ]; then
+            wine "$BIN_PATH" version
+          elif [ "${{ matrix.target }}" = "linux-x64" ]; then
+            "$BIN_PATH" version
+          fi
+
+      - name: Upload temp artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: temp-singbox-${{ matrix.target }}
+          path: singbox-multiplatform/
+          retention-days: 1
+
+  package:
+    name: Package Artifacts
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get latest release version
+        id: get_tag
+        run: |
+          TAG=$(gh release view --repo SagerNet/sing-box --json tagName -q .tagName)
+          VERSION=${TAG#v}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: temp-singbox-*
+          path: final-singbox-multiplatform
+          merge-multiple: true
+
+      - name: Display structure of downloaded files
+        run: find final-singbox-multiplatform -type f
+
+      - name: Upload final combined artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: singbox-multiplatform-${{ steps.get_tag.outputs.version }}
+          path: final-singbox-multiplatform
