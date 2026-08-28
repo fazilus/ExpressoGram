@@ -355,13 +355,12 @@ jobs:
           curl -sL "https://github.com/JetBrains/kotlin/releases/download/v${KOTLIN_VERSION}/kotlin-compiler-${KOTLIN_VERSION}.zip" -o kotlinc.zip
           unzip -q kotlinc.zip
           
-          # The Kotlin compiler archive extracts to "kotlinc/" (no version suffix)
           chmod +x ./kotlinc/bin/kotlinc
           
           echo "=== Kotlin compiler version ==="
           ./kotlinc/bin/kotlinc -version
           
-          ./kotlinc/bin/kotlinc artifacts/kotlin/TdApi.kt -d /tmp/tdapi-check.jar
+          ./kotlinc/bin/kotlinc -J-Xmx4g artifacts/kotlin/TdApi.kt -d /tmp/tdapi-check.jar
           echo "TdApi.kt compiles cleanly."
 
       - name: Upload TdApi.kt artifact
