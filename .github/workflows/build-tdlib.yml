@@ -93,8 +93,19 @@ jobs:
       - name: Install vcpkg and dependencies (static)
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           cd ${{ github.workspace }}
-          git clone https://github.com/Microsoft/vcpkg.git
+
+          if (-not (Test-Path "vcpkg\.git")) {
+            if (Test-Path "vcpkg") {
+              Write-Host "Removing incomplete/stale vcpkg directory (likely left over from cache restore)..."
+              Remove-Item -Recurse -Force "vcpkg"
+            }
+            git clone https://github.com/Microsoft/vcpkg.git
+          } else {
+            Write-Host "vcpkg repo already present, skipping clone."
+          }
+
           cd vcpkg
           .\bootstrap-vcpkg.bat
           .\vcpkg install openssl:x64-windows-static zlib:x64-windows-static
