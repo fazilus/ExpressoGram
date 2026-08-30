@@ -577,15 +577,15 @@ jobs:
           cp java-sources/TdApi.java artifacts/java-sources/org/drinkless/tdlib/
           
           # Client.java may be missing from artifact if it wasn't found during build
-          JAVADOC_SOURCES="org/drinkless/tdlib/TdApi.java"
+          JAVADOC_SOURCES="artifacts/java-sources/org/drinkless/tdlib/TdApi.java"
           if [ -f "java-sources/Client.java" ]; then
             cp java-sources/Client.java artifacts/java-sources/org/drinkless/tdlib/
-            JAVADOC_SOURCES="$JAVADOC_SOURCES org/drinkless/tdlib/Client.java"
+            JAVADOC_SOURCES="$JAVADOC_SOURCES artifacts/java-sources/org/drinkless/tdlib/Client.java"
           else
             echo "::warning::Client.java not found in artifacts. Javadoc will only cover TdApi."
           fi
           
-          if ! javadoc \
+          javadoc \
             -d artifacts/javadoc \
             -sourcepath artifacts/java-sources \
             -windowtitle "TDLib Java API" \
@@ -593,10 +593,13 @@ jobs:
             -header "TDLib JNI" \
             -Xdoclint:none \
             -quiet \
-            $JAVADOC_SOURCES; then
-            echo "::warning::Javadoc generation failed. Check the logs for errors."
+            $JAVADOC_SOURCES
+
+          if [ ! -f "artifacts/javadoc/index.html" ]; then
+            echo "::error::Javadoc generation did not produce index.html. See the javadoc output above for the actual error."
+            exit 1
           fi
-          
+
           cat > artifacts/VERSION.txt << EOF
           TDLib Javadoc
           TDLib commit: ${{ needs.get-tdlib-version.outputs.commit_sha }}
@@ -656,8 +659,9 @@ jobs:
           TDAPI_CONVERSION_SUMMARY="TdApi.kt was not generated (build-linux did not run or failed)."
           if [ -d "all-artifacts/tdlib-tdapi-kotlin-$COMMIT_SHORT" ]; then
             cp all-artifacts/tdlib-tdapi-kotlin-$COMMIT_SHORT/TdApi.kt release/kotlin/ || true
+            # Stats are folded into VERSION.txt below, not copied as a separate file
+            # to avoid duplicating the same information twice in the release.
             if [ -f "all-artifacts/tdlib-tdapi-kotlin-$COMMIT_SHORT/TdApi.conversion-stats.json" ]; then
-              cp all-artifacts/tdlib-tdapi-kotlin-$COMMIT_SHORT/TdApi.conversion-stats.json release/kotlin/ || true
               TDAPI_CONVERSION_SUMMARY=$(cat all-artifacts/tdlib-tdapi-kotlin-$COMMIT_SHORT/TdApi.conversion-stats.json)
             fi
           fi
@@ -694,17 +698,9 @@ jobs:
           echo "=== Build artifacts ==="
           find release -type f -ls
 
-      - name: Create release zip
-        run: |
-          COMMIT_SHORT=${{ needs.get-tdlib-version.outputs.commit_short }}
-          cd release
-          zip -r "../expressogram-tdlib-$COMMIT_SHORT.zip" .
-          cd ..
-          ls -lh "expressogram-tdlib-$COMMIT_SHORT.zip"
-
       - name: Upload combined release
         uses: actions/upload-artifact@v4
         with:
           name: expressogram-tdlib-${{ needs.get-tdlib-version.outputs.commit_short }}
-          path: expressogram-tdlib-${{ needs.get-tdlib-version.outputs.commit_short }}.zip
+          path: release/
           if-no-files-found: error
